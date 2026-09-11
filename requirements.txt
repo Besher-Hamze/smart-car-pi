@@ -1,0 +1,7 @@
+numpy
+opencv-python
+gpiozero
+lgpio
+scikit-learn
+joblib
+# tensorflow  — for Donkey CNN training (PC is easier than the Pi)

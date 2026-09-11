@@ -1,0 +1,10 @@
+__pycache__/
+.venv/
+venv/
+debug/
+data/
+models/*.pkl
+models/*.tflite
+models/*.keras
+*.jpg
+.DS_Store
