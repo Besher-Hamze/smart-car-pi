@@ -60,12 +60,17 @@ class Motors:
         self._side(self.rp, self.r3, self.r4, right, config.INVERT_RIGHT)
 
     def go(self, offset, throttle=1.0, speed=None):
-        """offset -1..+1. throttle 0..1 (Donkey-style). speed is 15..90 from the page."""
+        """offset -1..+1. throttle 0..1. Tight yellow bends reverse the inner wheel."""
         off = max(-1.0, min(1.0, config.STEER_SIGN * float(offset)))
-        thr = max(0.25, min(1.0, float(throttle)))
+        thr = max(0.35, min(1.0, float(throttle)))
         base = config.SPEED if speed is None else float(speed)
-        pwm = base * thr * (1.0 - config.SLOW_IN_TURN * abs(off))
-        steer = off * min(config.TURN, max(22.0, base * 1.2))
+        floor = getattr(config, "AUTO_PWM_FLOOR", 0.45)
+        pwm = max(base * thr, base * floor)
+        turn_scale = max(float(config.TURN) * 0.92, base * 1.45)
+        if abs(off) > 0.12:
+            turn_scale *= 1.12
+        steer = off * turn_scale
+        pwm *= 1.0 - config.SLOW_IN_TURN * 0.55 * min(1.0, abs(off))
         left = pwm + steer
         right = pwm - steer
         self.drive(left, right)

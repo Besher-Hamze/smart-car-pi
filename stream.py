@@ -1,7 +1,10 @@
 """Live view + Auto / Manual drive: http://PI-IP:8080/"""
 
+import base64
+import hashlib
 import json
 import socket
+import struct
 import subprocess
 import threading
 import time
@@ -79,7 +82,11 @@ PAGE = """<!DOCTYPE html>
     <span id="dist">-- cm</span>
   </div>
   <div class="speed">
-    <label>SPEED <span id="spdval">40</span></label>
+    <label>AUTO SPEED <span id="aspdval">32</span></label>
+    <input id="aspd" type="range" min="15" max="90" value="32">
+  </div>
+  <div class="speed">
+    <label>MANUAL SPEED <span id="spdval">40</span></label>
     <input id="spd" type="range" min="15" max="90" value="40">
   </div>
   <div class="speed">
@@ -97,7 +104,7 @@ PAGE = """<!DOCTYPE html>
     <button type="button" data-k="back">&#9660;</button>
     <div></div>
   </div>
-  <p class="hint">الأزرار ضغطة واحدة تمشي — ■ توقف. REC لازم العداد يزيد وأنت تسوق. TRAIN بعد 3 لفات.</p>
+  <p class="hint">AUTO = خط أصفر واحد (YELLOW_LINES=1 في config). HUG-R / HUG-L على الشاشة.</p>
   <div id="logbox">
     <h3>smart-car.service  ·  journalctl</h3>
     <pre id="log">waiting...</pre>
@@ -111,7 +118,8 @@ let recN = 0;
 let recTotal = 0;
 let trainBusy = false;
 let hasPilot = false;
-let speed = 40;
+let autoSpeed = 32;
+let manualSpeed = 40;
 let epochs = 40;
 const map = {w:"fwd", ArrowUp:"fwd", s:"back", ArrowDown:"back", a:"left", ArrowLeft:"left", d:"right", ArrowRight:"right"};
 
@@ -129,12 +137,16 @@ function paint() {
   if (trainBusy) st = "TRAINING";
   if (hasPilot) st += "  ·  PILOT";
   st += "  ·  " + recTotal + " صور";
-  st += "  ·  " + speed;
+  st += mode === "auto" ? ("  ·  A" + autoSpeed) : ("  ·  M" + manualSpeed);
   document.getElementById("st").textContent = st;
+  const asv = document.getElementById("aspdval");
+  const asl = document.getElementById("aspd");
+  if (asv) asv.textContent = String(autoSpeed);
+  if (asl && document.activeElement !== asl) asl.value = String(autoSpeed);
   const sv = document.getElementById("spdval");
   const sl = document.getElementById("spd");
-  if (sv) sv.textContent = String(speed);
-  if (sl && document.activeElement !== sl) sl.value = String(speed);
+  if (sv) sv.textContent = String(manualSpeed);
+  if (sl && document.activeElement !== sl) sl.value = String(manualSpeed);
   const ev = document.getElementById("epval");
   const el = document.getElementById("ep");
   if (ev) ev.textContent = String(epochs);
@@ -176,7 +188,7 @@ function setMode(m) {
     post("/api/rec", {on: false});
   }
   paint();
-  post("/api/mode", {mode: m});
+  sendKeys();
 }
 
 document.getElementById("rec").onclick = () => {
@@ -207,9 +219,29 @@ document.getElementById("wipe").onclick = () => {
   paint();
 };
 
+let driveWs = null;
+
+function connectDrive() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  const ws = new WebSocket(proto + "//" + location.host + "/ws");
+  driveWs = ws;
+  ws.onopen = () => sendKeys();
+  ws.onclose = () => {
+    if (driveWs === ws) driveWs = null;
+    setTimeout(connectDrive, 400);
+  };
+  ws.onerror = () => { try { ws.close(); } catch (e) {} };
+}
+
 function sendKeys() {
-  if (mode !== "manual") return;
-  post("/api/keys", keys);
+  if (!driveWs || driveWs.readyState !== 1) return;
+  driveWs.send(JSON.stringify({
+    fwd: keys.fwd, back: keys.back, left: keys.left, right: keys.right,
+    mode: mode,
+    speed: mode === "auto" ? autoSpeed : manualSpeed,
+    auto_speed: autoSpeed,
+    manual_speed: manualSpeed
+  }));
 }
 
 function tapPad(k) {
@@ -259,10 +291,18 @@ document.querySelectorAll(".pad [data-k]").forEach(b => {
   });
 });
 
+document.getElementById("aspd").addEventListener("input", () => {
+  autoSpeed = Number(document.getElementById("aspd").value);
+  document.getElementById("aspdval").textContent = String(autoSpeed);
+  sendKeys();
+  post("/api/auto_speed", {speed: autoSpeed});
+  paint();
+});
 document.getElementById("spd").addEventListener("input", () => {
-  speed = Number(document.getElementById("spd").value);
-  document.getElementById("spdval").textContent = String(speed);
-  post("/api/speed", {speed: speed});
+  manualSpeed = Number(document.getElementById("spd").value);
+  document.getElementById("spdval").textContent = String(manualSpeed);
+  sendKeys();
+  post("/api/speed", {speed: manualSpeed});
   paint();
 });
 
@@ -295,7 +335,8 @@ window.addEventListener("blur", () => {
   paint();
 });
 
-setInterval(() => { if (mode === "manual") sendKeys(); }, 200);
+connectDrive();
+setInterval(sendKeys, 80);
 
 function pullStatus() {
   fetch("/api/status").then(r => r.json()).then(s => {
@@ -305,7 +346,8 @@ function pullStatus() {
     recTotal = s.rec_total || 0;
     trainBusy = !!s.train_busy;
     hasPilot = !!s.has_pilot;
-    if (typeof s.speed === "number") speed = s.speed;
+    if (typeof s.auto_speed === "number") autoSpeed = s.auto_speed;
+    if (typeof s.manual_speed === "number") manualSpeed = s.manual_speed;
     if (typeof s.epochs === "number") epochs = s.epochs;
     paint();
     paintDist(s);
@@ -350,7 +392,8 @@ class Hub:
         self.update(blank)
 
     def update(self, frame):
-        ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
+        q = int(getattr(config, "STREAM_JPEG_QUALITY", 72))
+        ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), q])
         if not ok:
             return
         with self.lock:
@@ -382,10 +425,12 @@ class Control:
         self.logs = []
         self.reload_pilot = False
         self.wipe_rec = False
-        self.speed = float(config.MANUAL_SPEED)
+        self.auto_speed = float(getattr(config, "AUTO_SPEED_DEFAULT", 32))
+        self.manual_speed = float(config.MANUAL_SPEED)
+        self.speed = self.auto_speed
         self.epochs = int(config.TRAIN_EPOCHS)
         self.touched = time.monotonic()
-        self.add_log("ready  —  REC 3 laps, then TRAIN, then AUTO")
+        self.add_log("ready  —  MANUAL REC 3 laps → TRAIN → AUTO (PILOT)")
 
     def set_mode(self, mode):
         mode = "manual" if mode == "manual" else "auto"
@@ -394,6 +439,9 @@ class Control:
             if mode == "auto":
                 self.fwd = self.back = self.left = self.right = False
                 self.rec = False
+                self.speed = self.auto_speed
+            else:
+                self.speed = self.manual_speed
             self.touched = time.monotonic()
         self.add_log("mode " + self.mode)
         return self.mode
@@ -453,7 +501,21 @@ class Control:
             value = config.MANUAL_SPEED
         value = max(config.SPEED_MIN, min(config.SPEED_MAX, value))
         with self.lock:
-            self.speed = value
+            self.manual_speed = value
+            if self.mode != "auto":
+                self.speed = value
+        return value
+
+    def set_auto_speed(self, value):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            value = float(getattr(config, "AUTO_SPEED_DEFAULT", 32))
+        value = max(config.SPEED_MIN, min(config.SPEED_MAX, value))
+        with self.lock:
+            self.auto_speed = value
+            if self.mode == "auto":
+                self.speed = value
         return value
 
     def set_epochs(self, value):
@@ -468,11 +530,46 @@ class Control:
 
     def set_keys(self, data):
         with self.lock:
-            self.mode = "manual"
-            self.fwd = bool(data.get("fwd"))
-            self.back = bool(data.get("back"))
-            self.left = bool(data.get("left"))
-            self.right = bool(data.get("right"))
+            if data.get("mode") == "auto":
+                self.mode = "auto"
+                self.fwd = self.back = self.left = self.right = False
+            else:
+                self.mode = "manual"
+                self.fwd = bool(data.get("fwd"))
+                self.back = bool(data.get("back"))
+                self.left = bool(data.get("left"))
+                self.right = bool(data.get("right"))
+            if "auto_speed" in data:
+                try:
+                    self.auto_speed = max(
+                        config.SPEED_MIN,
+                        min(config.SPEED_MAX, float(data.get("auto_speed"))),
+                    )
+                except (TypeError, ValueError):
+                    pass
+            if "manual_speed" in data:
+                try:
+                    self.manual_speed = max(
+                        config.SPEED_MIN,
+                        min(config.SPEED_MAX, float(data.get("manual_speed"))),
+                    )
+                except (TypeError, ValueError):
+                    pass
+            if "speed" in data:
+                try:
+                    v = max(config.SPEED_MIN, min(config.SPEED_MAX, float(data.get("speed"))))
+                    if self.mode == "auto":
+                        self.auto_speed = v
+                    else:
+                        self.manual_speed = v
+                except (TypeError, ValueError):
+                    pass
+            self.speed = self.auto_speed if self.mode == "auto" else self.manual_speed
+            self.touched = time.monotonic()
+
+    def stop_keys(self):
+        with self.lock:
+            self.fwd = self.back = self.left = self.right = False
             self.touched = time.monotonic()
 
     def set_range(self, cm, blocked):
@@ -484,7 +581,9 @@ class Control:
         with self.lock:
             fwd, back, left, right = self.fwd, self.back, self.left, self.right
             mode = self.mode
-            speed = self.speed
+            auto_speed = self.auto_speed
+            manual_speed = self.manual_speed
+            speed = auto_speed if self.mode == "auto" else manual_speed
             rec = self.rec
             stale = (time.monotonic() - self.touched) > (2.8 if rec else config.HOLD_TIMEOUT)
         if mode == "manual" and stale:
@@ -499,6 +598,8 @@ class Control:
             has_pilot = self.has_pilot
             train_busy, train_log = self.train_busy, self.train_log
             epochs = self.epochs
+            auto_speed = self.auto_speed
+            manual_speed = self.manual_speed
             logs = list(self.logs[-120:])
         return {
             "mode": mode,
@@ -507,6 +608,8 @@ class Control:
             "left": left,
             "right": right,
             "speed": speed,
+            "auto_speed": auto_speed,
+            "manual_speed": manual_speed,
             "epochs": epochs,
             "cm": cm,
             "blocked": blocked,
@@ -587,6 +690,98 @@ def _read_json(handler):
         return {}
 
 
+def _recv_exact(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            return b""
+        buf += chunk
+    return buf
+
+
+def _ws_accept(key):
+    raw = hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()
+    return base64.b64encode(raw).decode("ascii")
+
+
+def _ws_send(sock, text):
+    data = text.encode("utf-8")
+    header = bytearray([0x81])
+    n = len(data)
+    if n < 126:
+        header.append(n)
+    elif n < 65536:
+        header.append(126)
+        header.extend(struct.pack("!H", n))
+    else:
+        header.append(127)
+        header.extend(struct.pack("!Q", n))
+    sock.sendall(header + data)
+
+
+def _ws_read(sock):
+    hdr = _recv_exact(sock, 2)
+    if len(hdr) < 2:
+        return None, None
+    opcode = hdr[0] & 0x0F
+    masked = hdr[1] & 0x80
+    length = hdr[1] & 0x7F
+    if length == 126:
+        ext = _recv_exact(sock, 2)
+        if len(ext) < 2:
+            return None, None
+        length = struct.unpack("!H", ext)[0]
+    elif length == 127:
+        ext = _recv_exact(sock, 8)
+        if len(ext) < 8:
+            return None, None
+        length = struct.unpack("!Q", ext)[0]
+    mask = _recv_exact(sock, 4) if masked else b""
+    if masked and len(mask) < 4:
+        return None, None
+    data = _recv_exact(sock, length) if length else b""
+    if length and len(data) < length:
+        return None, None
+    if masked and data:
+        data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+    return opcode, data
+
+
+def _ws_loop(sock, control):
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception:
+        pass
+    sock.settimeout(8)
+    try:
+        while True:
+            opcode, data = _ws_read(sock)
+            if opcode is None:
+                break
+            if opcode == 8:
+                break
+            if opcode == 9:
+                sock.sendall(b"\x8a" + bytes([len(data)]) + data)
+                continue
+            if opcode != 1:
+                continue
+            try:
+                msg = json.loads(data.decode("utf-8") or "{}")
+            except Exception:
+                continue
+            if isinstance(msg, dict):
+                control.set_keys(msg)
+    except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+        pass
+    finally:
+        control.stop_keys()
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
 def _send(handler, code, body, ctype):
     data = body if isinstance(body, bytes) else body.encode("utf-8")
     handler.send_response(code)
@@ -604,6 +799,18 @@ def start(hub, port, control):
 
         def do_GET(self):
             path = self.path.split("?", 1)[0]
+            if path == "/ws":
+                key = self.headers.get("Sec-WebSocket-Key", "")
+                if not key or "websocket" not in self.headers.get("Upgrade", "").lower():
+                    self.send_error(400)
+                    return
+                self.send_response(101, "Switching Protocols")
+                self.send_header("Upgrade", "websocket")
+                self.send_header("Connection", "Upgrade")
+                self.send_header("Sec-WebSocket-Accept", _ws_accept(key))
+                self.end_headers()
+                _ws_loop(self.connection, control)
+                return
             if path == "/":
                 _send(self, 200, PAGE, "text/html; charset=utf-8")
                 return
@@ -634,12 +841,15 @@ def start(hub, port, control):
                 _send(self, 200, json.dumps({"ok": True, "mode": mode}), "application/json")
                 return
             if path == "/api/keys":
-                control.set_keys(data)
-                _send(self, 200, json.dumps({"ok": True}), "application/json")
+                self.send_error(410)
                 return
             if path == "/api/speed":
                 sp = control.set_speed(data.get("speed", config.MANUAL_SPEED))
                 _send(self, 200, json.dumps({"ok": True, "speed": sp}), "application/json")
+                return
+            if path == "/api/auto_speed":
+                sp = control.set_auto_speed(data.get("speed", getattr(config, "AUTO_SPEED_DEFAULT", 32)))
+                _send(self, 200, json.dumps({"ok": True, "auto_speed": sp}), "application/json")
                 return
             if path == "/api/epochs":
                 ep = control.set_epochs(data.get("epochs", config.TRAIN_EPOCHS))

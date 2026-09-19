@@ -5,12 +5,13 @@ import signal
 import time
 
 import cv2
+import numpy as np
 
 import config
 from camera import Camera
 from follow import Follower
 from motors import Motors
-from pilot import Pilot, keys_to_cmd
+from pilot import Pilot, keys_to_cmd, pack_image
 from recorder import Recorder
 from stream import Control, Hub, start
 from ultrasonic import Ultrasonic
@@ -47,6 +48,42 @@ def _range_overlay(vis, cm, blocked, backing=False):
         )
 
 
+def _pilot_vis(frame, steer, throttle):
+    vis = frame.copy()
+    h, w = vis.shape[:2]
+    thumb = pack_image(frame)
+    if thumb.ndim == 2:
+        thumb = cv2.cvtColor((thumb * 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+    else:
+        thumb = (thumb * 255).astype(np.uint8)
+        thumb = cv2.cvtColor(thumb, cv2.COLOR_RGB2BGR)
+    vis[8:68, w - 168 : w - 8] = cv2.resize(thumb, (160, 60))
+    cv2.putText(
+        vis,
+        f"PILOT  steer {steer:+.2f}  thr {throttle:.2f}",
+        (10, 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (0, 255, 255),
+        2,
+    )
+    return vis
+
+
+def _need_train_vis(frame):
+    vis = frame.copy()
+    cv2.putText(
+        vis,
+        "NO MODEL — MANUAL: REC 3 laps, TRAIN, then AUTO",
+        (10, 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (0, 180, 255),
+        2,
+    )
+    return vis
+
+
 def _paint(vis, mode, keys, cm, blocked, backing, extra=""):
     if extra:
         color = (0, 0, 255) if extra.startswith("REC") else (0, 255, 255) if "PILOT" in extra else (0, 220, 80)
@@ -68,12 +105,12 @@ def main():
     cam = Camera()
     motors = Motors()
     follow = Follower()
+    pilot = Pilot.load()
     rec = Recorder()
-    brain = Pilot.load()
     us = Ultrasonic()
     hub = Hub()
     control = Control()
-    control.has_pilot = brain is not None
+    control.has_pilot = pilot is not None
     control.rec_total = count_samples()
     start(hub, config.STREAM_PORT, control)
 
@@ -85,10 +122,13 @@ def main():
 
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
-    print("Ready. Page: REC 3 laps then TRAIN then AUTO.")
+    drive = getattr(config, "AUTO_DRIVE", "pilot")
+    print(f"Ready. AUTO uses {drive}." + (" REC+TRAIN if no model yet." if pilot is None else ""))
 
     n = 0
     last_rec = False
+    last_mode = None
+    last_pilot_steer = 0.0
     try:
         while run:
             frame = cam.read()
@@ -118,10 +158,11 @@ def main():
                     control.rec_total = count_samples()
                     control.add_log("REC saved  total=" + str(control.rec_total))
             if control.reload_pilot:
-                brain = Pilot.load()
-                control.has_pilot = brain is not None
-                control.reload_pilot = False
-                control.add_log("PILOT ready" if brain else "PILOT failed to load")
+                pilot = Pilot.load()
+                with control.lock:
+                    control.has_pilot = pilot is not None
+                    control.reload_pilot = False
+                control.add_log("PILOT loaded" if pilot else "PILOT missing — train again")
             if mode == "manual" and rec.on:
                 st, th = keys_to_cmd(fwd, back, left_key, right_key)
                 rec.write(frame, st, th)
@@ -150,90 +191,59 @@ def main():
                 if rec.on and rec.n == 0:
                     extra = "REC 0  tap fwd"
                 hub.update(_paint(vis, mode, keys, cm, False, False, extra))
+                last_mode = mode
                 n += 1
                 continue
 
-            if brain is not None:
-                vis = frame.copy()
-                try:
-                    steer, throttle = brain.act(frame)
-                except Exception as exc:
-                    print("[pilot] act failed — using road scanner:", exc)
-                    brain = None
-                    control.has_pilot = False
-                    control.add_log("PILOT off — press TRAIN, then AUTO")
-                    # fall through to scanline follower
+            if last_mode != "auto":
+                if drive == "follow":
+                    follow.reset()
+                last_pilot_steer = 0.0
+            last_mode = "auto"
+
+            backing = bool(blocked)
+            if drive == "follow":
+                found, offset, vis, _lost_lane, thr = follow.step(frame)
+                extra = f"{follow.tag}  {int(speed)}"
+                if backing:
+                    left, right = motors.backup(offset, speed=speed)
+                    why = "back"
                 else:
-                    cv2.putText(
-                        vis,
-                        f"PILOT {steer:+.2f}  thr={throttle:.2f}",
-                        (10, 28),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
-                        (0, 255, 255),
-                        2,
-                    )
-                    if blocked:
+                    left, right = motors.go(offset, throttle=thr, speed=speed)
+                    why = "lane" if found else "find"
+            else:
+                if pilot is None:
+                    motors.stop()
+                    vis = _need_train_vis(frame)
+                    extra = "NEED TRAIN"
+                    left, right = 0.0, 0.0
+                    why = "no-model"
+                else:
+                    steer, thr = pilot.act(frame)
+                    thr = max(float(getattr(config, "PILOT_THR_MIN", 0.42)), float(thr))
+                    step = float(getattr(config, "PILOT_STEER_STEP", 0.14))
+                    if steer > last_pilot_steer + step:
+                        steer = last_pilot_steer + step
+                    elif steer < last_pilot_steer - step:
+                        steer = last_pilot_steer - step
+                    last_pilot_steer = steer
+                    vis = _pilot_vis(frame, steer, thr)
+                    extra = "PILOT"
+                    if backing:
                         left, right = motors.backup(steer, speed=speed)
                         why = "back"
-                        backing = True
                     else:
-                        left, right = motors.go(steer, throttle, speed=speed)
+                        left, right = motors.go(steer, throttle=thr, speed=speed)
                         why = "pilot"
-                        backing = False
-                    hub.update(_paint(vis, "auto", keys, cm, blocked, backing, "PILOT AUTO"))
-                    n += 1
-                    if n % 15 == 0:
-                        dist = f"{cm:5.0f}cm" if cm is not None else "   -- "
-                        print(f"{why:8s}  {dist}  st={steer:+.2f}  L={left:.0f} R={right:.0f}")
-                    continue
-
-            found, offset, vis, lost_path = follow.step(frame)
-            backing = bool(blocked or lost_path or not found)
-            extra = "AUTO"
-
-            if backing:
-                left, right = motors.backup(offset, speed=speed)
-                why = "back"
-            else:
-                left, right = motors.go(offset, speed=speed)
-                why = "road"
-
-            t_end = time.monotonic() + config.STEP_SEC
-            while run and time.monotonic() < t_end:
-                live = cam.read()
-                if live is None:
-                    time.sleep(0.02)
-                    continue
-                found, offset, vis, lost_path = follow.step(live)
-                cm = us.cm()
-                blocked = us.blocked()
-                control.set_range(cm, blocked)
-                if control.snapshot()[0] != "auto":
-                    break
-                if (not backing) and blocked:
-                    motors.stop()
-                    break
-                hub.update(_paint(vis, "auto", keys, cm, blocked, backing, extra))
-            motors.stop()
-
-            t_end = time.monotonic() + config.PAUSE_SEC
-            while run and time.monotonic() < t_end:
-                live = cam.read()
-                if live is None:
-                    time.sleep(0.02)
-                    continue
-                found, offset, vis, _r = follow.step(live)
-                cm = us.cm()
-                blocked = us.blocked()
-                control.set_range(cm, blocked)
-                hub.update(_paint(vis, "auto", keys, cm, blocked, False, extra))
-                if control.snapshot()[0] != "auto":
-                    break
-
+            hub.update(_paint(vis, "auto", keys, cm, blocked, backing, extra))
             n += 1
-            dist = f"{cm:5.0f}cm" if cm is not None else "   -- "
-            print(f"{why:8s}  {dist}  off={offset:+.2f}  L={left:.0f} R={right:.0f}")
+            if n % 12 == 0:
+                dist = f"{cm:5.0f}cm" if cm is not None else "   -- "
+                if drive == "follow":
+                    print(f"{why:8s}  {dist}  off={offset:+.2f}  L={left:.0f} R={right:.0f}")
+                elif pilot is not None:
+                    print(f"{why:8s}  {dist}  steer={last_pilot_steer:+.2f}  L={left:.0f} R={right:.0f}")
+            continue
     finally:
         rec.close()
         motors.close()

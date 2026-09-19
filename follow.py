@@ -1,8 +1,6 @@
-"""Follow the printed gray road with a short memory and look-ahead.
+"""Camera only: follow yellow paint (one or two blobs). Stay on the road side of the line.
 
-Near scan = where the car is now. Far scan = where the road is going.
-Memory keeps the same road strip from frame to frame so a bend is a
-direction change, not a new random blob.
+Works with your track: gray/white road, yellow edge, black outside.
 """
 
 import cv2
@@ -11,174 +9,146 @@ import numpy as np
 import config
 
 
-def _all_runs(ok):
-    if ok.size == 0 or not ok.any():
-        return []
-    padded = np.concatenate(([False], ok, [False]))
-    d = np.diff(padded.astype(np.int8))
-    starts = np.flatnonzero(d == 1)
-    ends = np.flatnonzero(d == -1)
-    return list(zip(starts.tolist(), ends.tolist()))
-
-
-def _pick_run(ok, w, hint):
-    runs = [(a, b) for a, b in _all_runs(ok) if (b - a) >= 0.18 * w]
-    if not runs:
-        return None
-    if hint is None:
-        return max(runs, key=lambda r: r[1] - r[0])
-    return min(runs, key=lambda r: abs(0.5 * (r[0] + r[1]) - hint))
-
-
-def _row_road(bgr_row, hint):
-    """(left, right, cx) of the remembered road on this row, or None."""
-    row = bgr_row.reshape(1, -1, 3)
-    hsv = cv2.cvtColor(row, cv2.COLOR_BGR2HSV)[0]
-    s = hsv[:, 1].astype(np.int16)
-    v = hsv[:, 2].astype(np.int16)
-    gray = cv2.cvtColor(row, cv2.COLOR_BGR2GRAY)[0].astype(np.int16)
-    w = gray.size
-    gray_s = cv2.blur(gray.reshape(1, -1), (1, 15))[0]
-    cut = int(min(np.percentile(gray_s, 48), 135))
-    road = (gray_s <= cut) & (v < 190) & (s < 90)
-    road_u8 = cv2.morphologyEx(
-        (road.astype(np.uint8) * 255).reshape(1, -1),
-        cv2.MORPH_CLOSE,
-        np.ones((1, 27), np.uint8),
-    )[0]
-    run = _pick_run(road_u8 > 0, w, hint)
-    if run is None:
-        return None
-    a, b = run
-    mid = gray_s[a:b]
-    if float(mid.mean()) > 150:
-        return None
-    if (b - a) > 0.90 * w and float(mid.std()) > 22:
-        return None
-    dash = (v[a:b] >= 140) & (v[a:b] < 195) & (s[a:b] < 55)
-    if int(dash.sum()) >= 4:
-        cx = a + float(np.mean(np.flatnonzero(dash)))
-    else:
-        cx = 0.5 * (a + b)
-    if hint is not None and abs(cx - hint) > 0.42 * w:
-        return None
-    return a, b, float(cx)
-
-
 class Follower:
     def __init__(self):
-        self.near_cx = None
-        self.far_cx = None
-        self.heading = 0.0
-        self.hist = []
-        self.lost = 0
-        self.ok = 0
-        self.reverse = False
-        self.curve = 0
+        self.last_off = 0.0
+        self.tag = "INIT"
+        self.yellow_side = 1  # +1 yellow usually on right in image
+
+    def reset(self):
+        self.__init__()
+
+    def _yellow_mask(self, bgr):
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        m = cv2.inRange(hsv, np.array(config.YELLOW_LO, np.uint8), np.array(config.YELLOW_HI, np.uint8))
+        b, g, r = cv2.split(bgr)
+        bi, gi, ri = b.astype(np.int16), g.astype(np.int16), r.astype(np.int16)
+        bgr_y = (gi > bi + 4) & (ri > bi + 4) & (gi > 24) & (ri > 24)
+        v = hsv[:, :, 2]
+        y = ((m > 0) | bgr_y) & (v > 18)
+        out = (y.astype(np.uint8) * 255)
+        return cv2.morphologyEx(out, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+
+    def _blobs(self, mask, pw, ph):
+        y_min = int(ph * getattr(config, "HUG_Y_MIN", 0.22))
+        roi = mask[y_min:, :]
+        cnts, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        min_a = int(getattr(config, "HUG_MIN_AREA", 28))
+        blobs = []
+        for c in cnts:
+            a = cv2.contourArea(c)
+            if a < min_a:
+                continue
+            m = cv2.moments(c)
+            if m["m00"] < 1:
+                continue
+            cx = m["m10"] / m["m00"]
+            cy = m["m01"] / m["m00"] + y_min
+            blobs.append((float(cx), float(cy), float(a)))
+        return blobs
+
+    def _pick_one(self, blobs, pw):
+        side = str(getattr(config, "YELLOW_LINE_SIDE", "right")).lower()
+        blobs = sorted(blobs, key=lambda b: b[0])
+        if len(blobs) == 1:
+            return blobs[0]
+        if side == "left":
+            return blobs[0]
+        if side == "right":
+            return blobs[-1]
+        mid = pw * 0.5
+        if side == "inner":
+            return min(blobs, key=lambda b: abs(b[0] - mid))
+        if side == "outer":
+            return max(blobs, key=lambda b: abs(b[0] - mid))
+        return blobs[-1]
+
+    def _target_x(self, pw, side_key):
+        side = str(getattr(config, "YELLOW_LINE_SIDE", "right")).lower()
+        if side == "left" or side_key == "left":
+            return float(getattr(config, "YELLOW_TARGET_LEFT", 0.36)) * pw
+        return float(getattr(config, "YELLOW_TARGET_X", 0.64)) * pw
 
     def step(self, frame):
         h, w = frame.shape[:2]
-        y_far = int(h * 0.62)
-        y_mid = int(h * 0.76)
-        y_near = int(h * 0.90)
-        y0 = y_far
-
-        near = _row_road(frame[y_near], self.near_cx)
-        hint = near[2] if near is not None else self.near_cx
-        mid = _row_road(frame[y_mid], hint)
-        if mid is not None:
-            hint = mid[2]
-        far = _row_road(frame[y_far], hint)
-
-        bands = []
-        if far is not None:
-            bands.append((y_far, far))
-        if mid is not None:
-            bands.append((y_mid, mid))
-        if near is not None:
-            bands.append((y_near, near))
-
-        found = near is not None or mid is not None
-        if found:
-            ncx = near[2] if near is not None else mid[2]
-            fcx = far[2] if far is not None else (mid[2] if mid is not None else ncx)
-            if self.near_cx is not None:
-                ncx = 0.62 * ncx + 0.38 * self.near_cx
-            if self.far_cx is not None:
-                fcx = 0.62 * fcx + 0.38 * self.far_cx
-            self.near_cx = ncx
-            self.far_cx = fcx
-            self.lost = 0
-            self.ok += 1
-            if self.ok >= 2:
-                self.reverse = False
-        else:
-            self.ok = 0
-            self.lost += 1
-            ncx = self.near_cx if self.near_cx is not None else w * 0.5
-            fcx = self.far_cx if self.far_cx is not None else ncx
-            if self.lost >= config.LOST_REVERSE:
-                self.reverse = True
-
-        half = w / 2.0
-        near_off = float(np.clip((ncx - half) / half, -1.0, 1.0))
-        far_off = float(np.clip((fcx - half) / half, -1.0, 1.0))
-        bend = float(np.clip(far_off - near_off, -1.0, 1.0))
-        self.heading = 0.55 * bend + 0.45 * self.heading
-        self.hist.append(self.heading)
-        if len(self.hist) > 8:
-            self.hist.pop(0)
-
-        changed = False
-        if len(self.hist) >= 4:
-            old = float(np.mean(self.hist[:3]))
-            new = float(np.mean(self.hist[-3:]))
-            if abs(new) > 0.10 and old * new < 0:
-                changed = True
-            if abs(new - old) > 0.28:
-                changed = True
-
-        if abs(self.heading) > 0.16 or abs(far_off) > 0.28 or changed:
-            self.curve = 1 if (self.heading + far_off) >= 0 else -1
-            tag = "TURN R" if self.curve > 0 else "TURN L"
-            boost = 1.35 if changed else 1.20
-        else:
-            self.curve = 0
-            tag = "ROAD"
-            boost = 1.0
-
-        offset = (
-            config.STEER_GAIN * near_off
-            + config.LOOK_GAIN * far_off
-            + config.HEAD_GAIN * self.heading
-        )
-        offset = float(np.clip(offset * boost, -1.0, 1.0))
-        if self.reverse:
-            tag = "BACK"
-
+        y0 = int(h * config.ROI_TOP)
+        roi = frame[y0:, :]
+        pw = int(getattr(config, "FOLLOW_W", 200))
+        ph = int(getattr(config, "FOLLOW_H", 128))
+        small = cv2.resize(roi, (pw, ph), interpolation=cv2.INTER_AREA)
+        mask = self._yellow_mask(small)
+        blobs = self._blobs(mask, pw, ph)
         vis = frame.copy()
-        cv2.line(vis, (0, y0), (w, y0), (140, 140, 140), 1)
-        cv2.line(vis, (w // 2, y0), (w // 2, h), (255, 180, 0), 1)
-        pts = []
-        for y, (_a, _b, cx) in bands:
-            pts.append((int(cx), y))
-            cv2.line(vis, (_a, y), (_b, y), (0, 220, 0), 3)
-            cv2.circle(vis, (int(cx), y), 6, (0, 255, 255), -1)
-        if len(pts) >= 2:
-            cv2.polylines(vis, [np.array(pts, np.int32)], False, (0, 255, 0), 2)
-        aim = int(ncx)
-        cv2.circle(vis, (aim, y_near), 9, (0, 255, 0) if found else (0, 140, 255), -1)
-        strip = frame[y0:, :]
-        thumb = cv2.cvtColor(cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
-        vis[8:98, w - 168 : w - 8] = cv2.resize(thumb, (160, 90), interpolation=cv2.INTER_AREA)
-        color = (0, 80, 255) if tag == "BACK" else ((0, 255, 255) if self.curve else (0, 255, 0))
+        half = pw * 0.5
+        gain = float(getattr(config, "HUG_GAIN", 1.05))
+        use_one = int(getattr(config, "YELLOW_LINES", 1)) == 1
+        found = False
+        pick = None
+        target = self._target_x(pw, "right")
+
+        if len(blobs) >= 2 and not use_one:
+            blobs.sort(key=lambda b: b[0])
+            left, right = blobs[0], blobs[-1]
+            cx = 0.5 * (left[0] + right[0])
+            err = (cx - half) / half
+            self.tag = "2Y"
+            self.yellow_side = 1 if right[0] > half else -1
+            found = True
+            target = half
+        elif len(blobs) >= 1:
+            pick = self._pick_one(blobs, pw) if len(blobs) >= 2 else blobs[0]
+            side_name = str(getattr(config, "YELLOW_LINE_SIDE", "right")).lower()
+            sk = "left" if side_name == "left" else "right"
+            if side_name in ("inner", "outer"):
+                sk = "left" if pick[0] < half else "right"
+            target = self._target_x(pw, sk)
+            cx, cy, _ = pick
+            err = (cx - target) / half
+            suf = side_name[:1].upper()
+            self.tag = f"HUG-{suf}" if len(blobs) >= 2 else "HUG Y"
+            self.yellow_side = -1 if pick[0] < half else 1
+            found = True
+            blobs = [pick]
+        else:
+            turn = float(getattr(config, "HUG_SEARCH", 0.55)) * self.yellow_side
+            err = turn
+            self.tag = "TURN R" if self.yellow_side > 0 else "TURN L"
+            found = False
+
+        raw = float(np.clip(err * gain, -1.0, 1.0))
+        step = config.STEER_STEP
+        if raw > self.last_off + step:
+            raw = self.last_off + step
+        elif raw < self.last_off - step:
+            raw = self.last_off - step
+        if abs(raw) < config.STEER_DEAD:
+            raw = 0.0
+        offset = raw
+        self.last_off = offset
+        thr = config.AUTO_THR_MIN if found else max(0.4, config.AUTO_THR_MIN * 0.85)
+        turn = abs(offset)
+        throttle = max(thr, config.AUTO_THR_MIN * (1.0 - config.SLOW_IN_TURN * min(0.75, turn)))
+
+        self._draw(vis, y0, w, h, small, mask, blobs, target, found, pick)
+        return found, offset, vis, not found, throttle
+
+    def _draw(self, vis, y0, w, h, small, mask, blobs, target, found, pick=None):
+        pw, ph = small.shape[1], small.shape[0]
+        sx = (w - 1) / max(pw - 1, 1)
+        sy = (h - y0 - 1) / max(ph - 1, 1)
+        tx = int(target * sx)
+        cv2.line(vis, (tx, y0), (tx, h - 1), (255, 120, 0), 1)
+        for cx, cy, _ in blobs:
+            r = 9 if pick is not None and abs(cx - pick[0]) < 0.5 else 5
+            cv2.circle(vis, (int(cx * sx), y0 + int(cy * sy)), r, (0, 255, 255), 2)
+        cv2.line(vis, (w // 2, y0), (w // 2, h - 1), (255, 180, 0), 1)
+        col = (0, 255, 0) if found else (0, 180, 255)
         cv2.putText(
             vis,
-            f"{tag} {offset:+.2f}",
-            (10, 28),
+            f"{self.tag}  {self.last_off:+.2f}",
+            (8, 26),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            color,
+            0.65,
+            col,
             2,
         )
-        return found, offset, vis, self.reverse
