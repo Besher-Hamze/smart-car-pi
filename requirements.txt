@@ -1,7 +1,9 @@
 numpy
-opencv-python
+opencv-python-headless
 gpiozero
-lgpio
 scikit-learn
 joblib
+# lgpio — on the Pi use apt, not pip:  sudo apt install python3-lgpio
+# Create venv with:  python3 -m venv .venv --system-site-packages
 # tensorflow  — for Donkey CNN training (PC is easier than the Pi)
+# ultralytics  — only if SIGN_DETECTOR = "yolo" in config.py

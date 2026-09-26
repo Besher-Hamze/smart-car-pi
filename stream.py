@@ -36,6 +36,7 @@ PAGE = """<!DOCTYPE html>
   button.rec.on { background: #c62828; }
   button.train.on { background: #5b4db8; }
   button.wipe { background: #6b2a33; }
+  button.signs.on { background: #8b3a6d; }
   button:disabled { opacity: .45; cursor: not-allowed; }
   #logbox {
     margin-top: 12px; border-radius: 10px; background: #0b0f14; border: 1px solid #30363d;
@@ -78,6 +79,7 @@ PAGE = """<!DOCTYPE html>
     <button id="rec" class="rec">REC</button>
     <button id="train" class="train">TRAIN</button>
     <button id="wipe" class="wipe">مسح REC</button>
+    <button type="button" id="signs_btn" class="signs on">شاخصات</button>
     <span id="st">AUTO drive</span>
     <span id="dist">-- cm</span>
   </div>
@@ -104,7 +106,7 @@ PAGE = """<!DOCTYPE html>
     <button type="button" data-k="back">&#9660;</button>
     <div></div>
   </div>
-  <p class="hint">AUTO = خط أصفر واحد (YELLOW_LINES=1 في config). HUG-R / HUG-L على الشاشة.</p>
+  <p class="hint">شاخصات: cv خفيف أو yolo في config (SIGN_DETECTOR)</p>
   <div id="logbox">
     <h3>smart-car.service  ·  journalctl</h3>
     <pre id="log">waiting...</pre>
@@ -121,6 +123,7 @@ let hasPilot = false;
 let autoSpeed = 32;
 let manualSpeed = 40;
 let epochs = 40;
+let signsOn = true;
 const map = {w:"fwd", ArrowUp:"fwd", s:"back", ArrowDown:"back", a:"left", ArrowLeft:"left", d:"right", ArrowRight:"right"};
 
 function paint() {
@@ -132,10 +135,13 @@ function paint() {
   document.getElementById("rec").disabled = trainBusy;
   document.getElementById("wipe").disabled = trainBusy;
   document.getElementById("ep").disabled = trainBusy;
+  const sb = document.getElementById("signs_btn");
+  if (sb) sb.classList.toggle("on", signsOn);
   let st = mode === "auto" ? "AUTO" : "MANUAL";
   if (rec) st = "REC " + recN;
   if (trainBusy) st = "TRAINING";
   if (hasPilot) st += "  ·  PILOT";
+  if (mode === "auto") st += signsOn ? "  ·  شاخصات" : "  ·  بدون شاخصات";
   st += "  ·  " + recTotal + " صور";
   st += mode === "auto" ? ("  ·  A" + autoSpeed) : ("  ·  M" + manualSpeed);
   document.getElementById("st").textContent = st;
@@ -240,8 +246,16 @@ function sendKeys() {
     mode: mode,
     speed: mode === "auto" ? autoSpeed : manualSpeed,
     auto_speed: autoSpeed,
-    manual_speed: manualSpeed
+    manual_speed: manualSpeed,
+    signs_enabled: signsOn
   }));
+}
+
+function toggleSigns() {
+  signsOn = !signsOn;
+  paint();
+  post("/api/signs", {enabled: signsOn});
+  sendKeys();
 }
 
 function tapPad(k) {
@@ -282,6 +296,7 @@ function hold(k, on) {
 
 document.getElementById("auto").onclick = () => setMode("auto");
 document.getElementById("manual").onclick = () => setMode("manual");
+document.getElementById("signs_btn").onclick = () => toggleSigns();
 
 document.querySelectorAll(".pad [data-k]").forEach(b => {
   const k = b.getAttribute("data-k");
@@ -349,6 +364,7 @@ function pullStatus() {
     if (typeof s.auto_speed === "number") autoSpeed = s.auto_speed;
     if (typeof s.manual_speed === "number") manualSpeed = s.manual_speed;
     if (typeof s.epochs === "number") epochs = s.epochs;
+    if (typeof s.signs_enabled === "boolean") signsOn = s.signs_enabled;
     paint();
     paintDist(s);
   }).catch(() => {});
@@ -429,6 +445,7 @@ class Control:
         self.manual_speed = float(config.MANUAL_SPEED)
         self.speed = self.auto_speed
         self.epochs = int(config.TRAIN_EPOCHS)
+        self.signs_enabled = bool(getattr(config, "SIGNS_ENABLED", True))
         self.touched = time.monotonic()
         self.add_log("ready  —  MANUAL REC 3 laps → TRAIN → AUTO (PILOT)")
 
@@ -518,6 +535,12 @@ class Control:
                 self.speed = value
         return value
 
+    def set_signs_enabled(self, on):
+        with self.lock:
+            self.signs_enabled = bool(on)
+        self.add_log("signs " + ("ON" if on else "OFF"))
+        return self.signs_enabled
+
     def set_epochs(self, value):
         try:
             value = int(value)
@@ -564,6 +587,8 @@ class Control:
                         self.manual_speed = v
                 except (TypeError, ValueError):
                     pass
+            if "signs_enabled" in data:
+                self.signs_enabled = bool(data.get("signs_enabled"))
             self.speed = self.auto_speed if self.mode == "auto" else self.manual_speed
             self.touched = time.monotonic()
 
@@ -600,6 +625,7 @@ class Control:
             epochs = self.epochs
             auto_speed = self.auto_speed
             manual_speed = self.manual_speed
+            signs_enabled = self.signs_enabled
             logs = list(self.logs[-120:])
         return {
             "mode": mode,
@@ -610,6 +636,7 @@ class Control:
             "speed": speed,
             "auto_speed": auto_speed,
             "manual_speed": manual_speed,
+            "signs_enabled": signs_enabled,
             "epochs": epochs,
             "cm": cm,
             "blocked": blocked,
@@ -850,6 +877,10 @@ def start(hub, port, control):
             if path == "/api/auto_speed":
                 sp = control.set_auto_speed(data.get("speed", getattr(config, "AUTO_SPEED_DEFAULT", 32)))
                 _send(self, 200, json.dumps({"ok": True, "auto_speed": sp}), "application/json")
+                return
+            if path == "/api/signs":
+                on = control.set_signs_enabled(bool(data.get("enabled", True)))
+                _send(self, 200, json.dumps({"ok": True, "signs_enabled": on}), "application/json")
                 return
             if path == "/api/epochs":
                 ep = control.set_epochs(data.get("epochs", config.TRAIN_EPOCHS))

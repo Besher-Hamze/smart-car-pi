@@ -111,6 +111,41 @@ BLACK_V_MAX = 58
 BLACK_S_MAX = 95
 AUTO_SPEED_DEFAULT = 32
 
+# Signs: "cv" = light OpenCV on Pi | "yolo" = ready-made Ultralytics weights (pip install ultralytics).
+SIGN_DETECTOR = "cv"
+SIGNS_ENABLED = True
+SIGN_EVERY = 3
+# YOLO (when SIGN_DETECTOR = "yolo")
+#   nano / fast / coco → yolov8n (COCO stop sign, fastest on Pi 4)
+#   road → HuggingFace traffic model (STOP + lights + speed, heavier)
+SIGN_YOLO_PRESET = "road"
+SIGN_YOLO_CONF = 0.42
+SIGN_YOLO_IMGSZ = 288
+SIGN_YOLO_EVERY = 4
+SIGN_YOLO_MODEL = ""
+SIGN_YOLO_ROAD_REPO = "subhodeepmoitra/Traffic_signals_detection_YOLOv8m"
+SIGN_YOLO_ROAD_WEIGHTS = "best.pt"
+SIGN_DEFAULT_LIMIT = 50
+SIGN_ROI_TOP = 0.02
+SIGN_ROI_BOTTOM = 0.52
+SIGN_W = 200
+SIGN_CONFIRM_FRAMES = 3
+SIGN_RED_MIN_FRAC = 0.045
+SIGN_RED_FILL_MIN = 0.22
+SIGN_LIMIT_WHITE_MIN = 0.10
+SIGN_LIMIT_WHITE_LO = 0.045
+SIGN_STOP_WHITE_MAX = 0.08
+SIGN_STOP_VERT_MIN = 6
+SIGN_STOP_VERT_MAX = 11
+SIGN_LIMIT_MATCH_MIN = 0.24
+SIGN_STOP_MATCH_MIN = 0.23
+SIGN_PANEL_RED_MIN = 0.38
+SIGN_PANEL_GREEN_MIN = 0.36
+SIGN_STOP_HOLD_SEC = 2.2
+SIGN_LIMIT_LINGER_SEC = 2.5
+SIGN_LIMIT_30 = 30
+SIGN_LIMIT_50 = 50
+
 # If the car steers away from the line, set this to -1.
 STEER_SIGN = 1
 

@@ -14,6 +14,7 @@ from motors import Motors
 from pilot import Pilot, keys_to_cmd, pack_image
 from recorder import Recorder
 from stream import Control, Hub, start
+from signs import SignWatcher
 from ultrasonic import Ultrasonic
 
 
@@ -105,6 +106,7 @@ def main():
     cam = Camera()
     motors = Motors()
     follow = Follower()
+    sign_watch = SignWatcher()
     pilot = Pilot.load()
     rec = Recorder()
     us = Ultrasonic()
@@ -201,16 +203,39 @@ def main():
                 last_pilot_steer = 0.0
             last_mode = "auto"
 
+            with control.lock:
+                signs_on = control.signs_enabled
+            halt_sign, cap_sign, sign_label = (False, None, "")
+            if signs_on:
+                halt_sign, cap_sign, sign_label = sign_watch.update(frame)
+            drive_speed = float(speed)
+            if cap_sign is not None:
+                drive_speed = max(
+                    float(config.SPEED_MIN),
+                    min(float(config.SPEED_MAX), float(cap_sign)),
+                )
+
             backing = bool(blocked)
             if drive == "follow":
                 found, offset, vis, _lost_lane, thr = follow.step(frame)
-                extra = f"{follow.tag}  {int(speed)}"
-                if backing:
-                    left, right = motors.backup(offset, speed=speed)
+                if signs_on:
+                    sign_watch.draw(vis, halt_sign, cap_sign, sign_label)
+                if halt_sign:
+                    motors.stop()
+                    extra = f"STOP  {int(speed)}"
+                    why = "sign"
+                    left, right = 0.0, 0.0
+                elif backing:
+                    left, right = motors.backup(offset, speed=drive_speed)
                     why = "back"
+                    extra = f"{follow.tag}  {int(drive_speed)}"
                 else:
-                    left, right = motors.go(offset, throttle=thr, speed=speed)
+                    left, right = motors.go(offset, throttle=thr, speed=drive_speed)
                     why = "lane" if found else "find"
+                    if cap_sign is not None:
+                        extra = f"L{int(cap_sign)} {follow.tag}  {int(drive_speed)}"
+                    else:
+                        extra = f"{follow.tag}  {int(drive_speed)}"
             else:
                 if pilot is None:
                     motors.stop()
@@ -228,13 +253,21 @@ def main():
                         steer = last_pilot_steer - step
                     last_pilot_steer = steer
                     vis = _pilot_vis(frame, steer, thr)
-                    extra = "PILOT"
-                    if backing:
-                        left, right = motors.backup(steer, speed=speed)
+                    if signs_on:
+                        sign_watch.draw(vis, halt_sign, cap_sign, sign_label)
+                    if halt_sign:
+                        motors.stop()
+                        extra = "STOP"
+                        why = "sign"
+                        left, right = 0.0, 0.0
+                    elif backing:
+                        left, right = motors.backup(steer, speed=drive_speed)
                         why = "back"
+                        extra = "PILOT"
                     else:
-                        left, right = motors.go(steer, throttle=thr, speed=speed)
+                        left, right = motors.go(steer, throttle=thr, speed=drive_speed)
                         why = "pilot"
+                        extra = f"PILOT L{int(cap_sign)}" if cap_sign else "PILOT"
             hub.update(_paint(vis, "auto", keys, cm, blocked, backing, extra))
             n += 1
             if n % 12 == 0:
